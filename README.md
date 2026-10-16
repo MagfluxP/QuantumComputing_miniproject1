@@ -1,4 +1,4 @@
-# Grover mini-project: 4x4 Sudoku (Qiskit)
+# Grover mini-project: 4x4 Sudoku
 
 A Grover search circuit for completions of a partially filled 4x4 Sudoku, built
 from H, X, Z, CX and Toffoli gates. The only multi-controlled gate is one `mcx`
