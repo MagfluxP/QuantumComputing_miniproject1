@@ -65,10 +65,3 @@ raise `ValueError` in the oracle builders and make the sampler return `None`.
   are clean). Circuit resources are reported separately from simulation time.
 * Gate counts assume all-to-all connectivity and the gates the oracle uses (X, CX,
   Toffoli, Z).
-
-## Sources
-
-Grover (STOC 1996); Boyer, Brassard, Hoyer, Tapp, "Tight bounds on quantum
-searching" (1998) for the unknown-M search policy. Built-in Qiskit functionality
-used: `QuantumCircuit`, `Statevector` (small cross-check) and the circuit drawer.
-Everything else is hand-written.
