@@ -1,99 +1,110 @@
-"""4x4 Sudoku (n=2) with Grover's algorithm in Qiskit.
+"""General n² × n² Sudoku with clean reversible Grover oracles.
 
-Grid input: 4x4 list of lists, 0 = empty, 1..4 = clue.
-
-Encoding: each empty cell gets 2 search qubits holding digit-1 in binary
-(little-endian: first qubit = least significant bit). Empty cells are ordered
-row-major. Clues are classical and never stored in qubits.
-
-Register layout (qubit indices):
-    search : 2k qubits, cell i uses qubits (2i, 2i+1)
-    flags  : V qubits, 1 = "this constraint is satisfied"
-             - one "domain" flag per empty cell (digit is not excluded by any clue
-               in its row/column/block)
-             - one "differ" flag per pair of empty cells that share a unit
-    anc    : max(V-1, 0) ancillas for the Toffoli AND ladder
-Flags and ancillas start and end in |0>.
-
-Oracle: compute flags -> AND them with a Toffoli ladder -> Z on the result
-(single-qubit gate, no multi-controlled Z) -> uncompute. The only multi-controlled
-gate is in the diffuser, as the project allows.
+Digits are encoded as digit - 1 in little-endian registers. Domain flags
+reject unused binary codes as well as digits excluded by clues. Only X, CX,
+CCX and Z occur in the oracle; wider controls use clean Toffoli ladders.
 """
 
 from __future__ import annotations
 
 import math
 import random
+from dataclasses import dataclass
 from itertools import product
+from numbers import Integral
 
 import numpy as np
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import Statevector
 
 Grid = list[list[int]]
-N = 4  # grid side (n = 2)
 
-# --------------------------------------------------------------------------- #
-# Classical helpers (independent checker, used only for verification/validation)
-# --------------------------------------------------------------------------- #
+
+def grid_spec(grid: Grid) -> tuple[int, int, int]:
+    """Validate shape and clue types/ranges; return (side, block side, bit width)."""
+    if not isinstance(grid, (list, tuple)) or not grid:
+        raise ValueError("grid must be a nonempty square sequence of rows")
+    side = len(grid)
+    block = math.isqrt(side)
+    if block * block != side:
+        raise ValueError("grid side must be a perfect square (n²)")
+    if any(not isinstance(row, (list, tuple)) or len(row) != side for row in grid):
+        raise ValueError("grid must have exactly side entries in every row")
+    if any(
+        isinstance(v, bool) or not isinstance(v, Integral) or not 0 <= v <= side
+        for row in grid
+        for v in row
+    ):
+        raise ValueError(f"clues must be integers from 0 through {side}")
+    return side, block, max(1, (side - 1).bit_length())
 
 
 def is_valid_grid(g: Grid) -> bool:
-    """Every row, column and 2x2 block contains 1..4 exactly once."""
-    want = {1, 2, 3, 4}
-    rows = all(set(r) == want for r in g)
-    cols = all({g[r][c] for r in range(N)} == want for c in range(N))
-    blocks = all(
-        {g[r][c] for r in range(br, br + 2) for c in range(bc, bc + 2)} == want
-        for br in (0, 2)
-        for bc in (0, 2)
+    """Independent completed-grid checker; malformed grids return False."""
+    try:
+        side, block, _ = grid_spec(g)
+    except ValueError:
+        return False
+    want = set(range(1, side + 1))
+    return (
+        all(set(row) == want for row in g)
+        and all({g[r][c] for r in range(side)} == want for c in range(side))
+        and all(
+            {g[r][c] for r in range(br, br + block) for c in range(bc, bc + block)}
+            == want
+            for br in range(0, side, block)
+            for bc in range(0, side, block)
+        )
     )
-    return rows and cols and blocks
 
 
 def empties(grid: Grid) -> list[tuple[int, int]]:
-    return [(r, c) for r in range(N) for c in range(N) if grid[r][c] == 0]
+    side, _, _ = grid_spec(grid)
+    return [(r, c) for r in range(side) for c in range(side) if grid[r][c] == 0]
 
 
 def fill(grid: Grid, values: tuple[int, ...]) -> Grid:
-    out = [row[:] for row in grid]
+    out = [list(row) for row in grid]
     for (r, c), v in zip(empties(grid), values, strict=True):
         out[r][c] = v
     return out
 
 
 def brute_force_solutions(grid: Grid) -> list[tuple[int, ...]]:
-    """All completions (benchmark only). Values are digits 1..4."""
-    k = len(empties(grid))
+    """All completions (benchmark only), enumerating actual digits."""
+    side, _, _ = grid_spec(grid)
     return [
         vals
-        for vals in product(range(1, 5), repeat=k)
+        for vals in product(range(1, side + 1), repeat=len(empties(grid)))
         if is_valid_grid(fill(grid, vals))
     ]
 
 
-def shares_unit(a: tuple[int, int], b: tuple[int, int]) -> bool:
+def shares_unit(a: tuple[int, int], b: tuple[int, int], block: int = 2) -> bool:
     return (
-        a[0] == b[0] or a[1] == b[1] or (a[0] // 2, a[1] // 2) == (b[0] // 2, b[1] // 2)
+        a[0] == b[0]
+        or a[1] == b[1]
+        or (a[0] // block, a[1] // block) == (b[0] // block, b[1] // block)
     )
 
 
 def allowed_digits(grid: Grid, cell: tuple[int, int]) -> list[int]:
-    """Digits not excluded by clues in the cell's row/column/block."""
+    """Valid digits not excluded by clues; unused binary codes never qualify."""
+    side, block, _ = grid_spec(grid)
     used = {
         grid[r][c]
-        for r in range(N)
-        for c in range(N)
-        if grid[r][c] and (r, c) != cell and shares_unit(cell, (r, c))
+        for r in range(side)
+        for c in range(side)
+        if grid[r][c] and (r, c) != cell and shares_unit(cell, (r, c), block)
     }
-    return [d for d in range(1, 5) if d not in used]
+    return [d for d in range(1, side + 1) if d not in used]
 
 
 def clues_consistent(grid: Grid) -> bool:
-    """No two equal clues share a unit."""
-    cl = [(r, c) for r in range(N) for c in range(N) if grid[r][c]]
+    side, block, _ = grid_spec(grid)
+    cl = [(r, c) for r in range(side) for c in range(side) if grid[r][c]]
     return all(
-        not (grid[a[0]][a[1]] == grid[b[0]][b[1]] and shares_unit(a, b))
+        not (grid[a[0]][a[1]] == grid[b[0]][b[1]] and shares_unit(a, b, block))
         for i, a in enumerate(cl)
         for b in cl[i + 1 :]
     )
@@ -107,20 +118,24 @@ def clues_consistent(grid: Grid) -> bool:
 def pairs(grid: Grid) -> list[tuple[int, int]]:
     """Index pairs (i, j) of empty cells that share a row, column or block."""
     cells = empties(grid)
+    _, block, _ = grid_spec(grid)
     return [
         (i, j)
         for i in range(len(cells))
         for j in range(i + 1, len(cells))
-        if shares_unit(cells[i], cells[j])
+        if shares_unit(cells[i], cells[j], block)
     ]
 
 
 def layout(grid: Grid) -> tuple[list[int], list[int], list[int]]:
+    _, _, width = grid_spec(grid)
     k = len(empties(grid))
     v = k + len(pairs(grid))
-    search = list(range(2 * k))
-    flags = list(range(2 * k, 2 * k + v))
-    anc = list(range(2 * k + v, 2 * k + v + max(v - 1, 0)))
+    search = list(range(width * k))
+    flags = list(range(width * k, width * k + v))
+    # AND ladder first, then shared scratch for wide equality checks.
+    scratch = max(width - 2, 0) if k else 0
+    anc = list(range(width * k + v, width * k + v + max(v - 1, 0) + scratch))
     return search, flags, anc
 
 
@@ -130,39 +145,57 @@ def layout(grid: Grid) -> tuple[list[int], list[int], list[int]]:
 # --------------------------------------------------------------------------- #
 
 
-def _eq_const_ops(q0: int, q1: int, code: int, target: int) -> list[tuple]:
-    """target ^= [cell == code]; cell qubits (q0 LSB, q1) restored."""
-    zeros = [q for q, bit in ((q0, code & 1), (q1, code >> 1)) if bit == 0]
+def _controlled_x_ops(
+    controls: list[int], target: int, scratch: list[int]
+) -> list[tuple]:
+    """Clean multi-control X, decomposed exclusively into X/CX/CCX."""
+    if not controls:
+        return [("x", target)]
+    if len(controls) == 1:
+        return [("cx", controls[0], target)]
+    if len(controls) == 2:
+        return [("ccx", *controls, target)]
+    ladder = [("ccx", controls[0], controls[1], scratch[0])]
+    ladder += [
+        ("ccx", controls[i], scratch[i - 2], scratch[i - 1])
+        for i in range(2, len(controls) - 1)
+    ]
+    return (
+        ladder
+        + [("ccx", controls[-1], scratch[len(controls) - 3], target)]
+        + list(reversed(ladder))
+    )
+
+
+def _eq_const_ops(
+    qubits: list[int], code: int, target: int, scratch: list[int]
+) -> list[tuple]:
+    zeros = [q for i, q in enumerate(qubits) if not (code >> i) & 1]
     return (
         [("x", q) for q in zeros]
-        + [("ccx", q0, q1, target)]
+        + _controlled_x_ops(qubits, target, scratch)
         + [("x", q) for q in zeros]
     )
 
 
 def _compute_ops(grid: Grid) -> list[tuple]:
-    search, flags, _ = layout(grid)
+    search, flags, anc = layout(grid)
+    _, _, width = grid_spec(grid)
+    scratch = anc[max(len(flags) - 1, 0) :]
     cells = empties(grid)
     ops: list[tuple] = []
-    # domain flags: flag = OR over allowed digits of [cell == digit] (mutually exclusive)
     for i, cell in enumerate(cells):
-        q0, q1 = search[2 * i], search[2 * i + 1]
+        qubits = search[width * i : width * (i + 1)]
         for d in allowed_digits(grid, cell):
-            ops += _eq_const_ops(q0, q1, d - 1, flags[i])
-    # pair flags: flag = [cell_i != cell_j]
+            ops += _eq_const_ops(qubits, d - 1, flags[i], scratch)
     for p, (i, j) in enumerate(pairs(grid)):
-        a0, a1 = search[2 * i], search[2 * i + 1]
-        b0, b1 = search[2 * j], search[2 * j + 1]
+        a = search[width * i : width * (i + 1)]
+        b = search[width * j : width * (j + 1)]
         f = flags[len(cells) + p]
-        ops += [
-            ("cx", a0, b0),
-            ("cx", a1, b1),
-            ("x", b0),
-            ("x", b1),
-        ]  # b_k = (a_k == b_k)
-        ops += [("ccx", b0, b1, f)]  # f = [equal]
-        ops += [("x", b0), ("x", b1), ("cx", a1, b1), ("cx", a0, b0)]  # restore b
-        ops += [("x", f)]  # f = [different]
+        compare = [("cx", qa, qb) for qa, qb in zip(a, b, strict=True)]
+        compare += [("x", qb) for qb in b]
+        ops += compare + _controlled_x_ops(b, f, scratch)
+        ops += list(reversed(compare)) + [("x", f)]
     return ops
 
 
@@ -172,6 +205,7 @@ def _apply(qc: QuantumCircuit, ops: list[tuple], reverse: bool = False) -> None:
 
 
 def _validate(grid: Grid) -> None:
+    grid_spec(grid)
     if not clues_consistent(grid):
         raise ValueError("clues conflict: no valid completion exists")
     if not empties(grid):
@@ -218,6 +252,7 @@ def uncompute_checks_circuit(grid: Grid) -> QuantumCircuit:
 
 def sudoku_oracle(grid: Grid) -> QuantumCircuit:
     """S_f|z>|0> = (-1)^f(z)|z>|0>, f(z)=1 iff the filled grid is a valid Sudoku."""
+    _validate(grid)
     qc = _new_circuit(grid, "oracle")
     qc.compose(compute_checks_circuit(grid), inplace=True)
     qc.compose(phase_circuit(grid), inplace=True)
@@ -227,6 +262,7 @@ def sudoku_oracle(grid: Grid) -> QuantumCircuit:
 
 def grover_block_circuit(grid: Grid) -> QuantumCircuit:
     """One Grover iteration drawn as labelled blocks (for qc.draw('mpl'))."""
+    _validate(grid)
     search, flags, anc = layout(grid)
     n_q = len(search) + len(flags) + len(anc)
     qc = QuantumCircuit(n_q, name="grover_blocks")
@@ -244,6 +280,7 @@ def grover_block_circuit(grid: Grid) -> QuantumCircuit:
 
 def diffuser(grid: Grid) -> QuantumCircuit:
     """Inversion about the uniform state on the search register (uses one MCX)."""
+    _validate(grid)
     search, flags, anc = layout(grid)
     qc = QuantumCircuit(len(search) + len(flags) + len(anc), name="diffuser")
     qc.h(search)
@@ -257,6 +294,12 @@ def diffuser(grid: Grid) -> QuantumCircuit:
 
 
 def grover_circuit(grid: Grid, iterations: int) -> QuantumCircuit:
+    if (
+        isinstance(iterations, bool)
+        or not isinstance(iterations, Integral)
+        or iterations < 0
+    ):
+        raise ValueError("iterations must be a nonnegative integer")
     search, _, _ = layout(grid)
     oracle, diff = sudoku_oracle(grid), diffuser(grid)
     qc = QuantumCircuit(oracle.num_qubits)
@@ -272,9 +315,14 @@ def grover_circuit(grid: Grid, iterations: int) -> QuantumCircuit:
 # --------------------------------------------------------------------------- #
 
 
-def decode(z: int, k: int) -> tuple[int, ...]:
-    """Integer z (bit 2i,2i+1 = cell i) -> digits 1..4."""
-    return tuple(((z >> (2 * i)) & 3) + 1 for i in range(k))
+def decode(z: int, k: int, width: int = 2) -> tuple[int, ...]:
+    """Decode digit - 1; unused codes deliberately yield out-of-range digits."""
+    return tuple(((z >> (width * i)) & ((1 << width) - 1)) + 1 for i in range(k))
+
+
+def search_size(grid: Grid) -> int:
+    """Binary candidate count, including unused codes (e.g. 16**k for 9×9)."""
+    return 1 << len(layout(grid)[0])
 
 
 def simulate_basis(qc: QuantumCircuit, bits: int) -> tuple[int, int]:
@@ -307,10 +355,9 @@ def simulate_basis(qc: QuantumCircuit, bits: int) -> tuple[int, int]:
 def oracle_signs(grid: Grid) -> list[int]:
     """Sign (-1)^f(z) the oracle applies to |z>|0> for every z, computed from the
     circuit itself. Asserts every work qubit returns to |0>."""
-    k = len(empties(grid))
     oracle = sudoku_oracle(grid)
     signs = []
-    for z in range(4**k):
+    for z in range(search_size(grid)):
         out, sign = simulate_basis(oracle, z)  # work qubits start at 0
         assert out == z, f"work qubits not restored for z={z}"
         signs.append(sign)
@@ -324,7 +371,7 @@ def check_oracle(grid: Grid) -> None:
     (linearity). Exact: no tolerance needed."""
     k = len(empties(grid))
     for z, sign in enumerate(oracle_signs(grid)):
-        ok = is_valid_grid(fill(grid, decode(z, k)))
+        ok = is_valid_grid(fill(grid, decode(z, k, grid_spec(grid)[2])))
         assert sign == (-1 if ok else 1), (z, ok)
 
 
@@ -332,8 +379,8 @@ def check_oracle_statevector(grid: Grid, atol: float = 1e-12) -> None:
     """Same check with Qiskit's Statevector. Only for tiny puzzles (<= ~14 qubits)."""
     k = len(empties(grid))
     oracle = sudoku_oracle(grid)
-    for z in range(4**k):
-        ok = is_valid_grid(fill(grid, decode(z, k)))
+    for z in range(search_size(grid)):
+        ok = is_valid_grid(fill(grid, decode(z, k, grid_spec(grid)[2])))
         sv = Statevector.from_int(z, 2**oracle.num_qubits).evolve(oracle)
         assert abs(sv.data[z] - (-1.0 if ok else 1.0)) < atol, (z, ok)
 
@@ -361,36 +408,90 @@ def success_curve(grid: Grid, max_iter: int) -> list[float]:
     return [float((a[good] ** 2).sum()) for a in _grover_states(grid, max_iter)]
 
 
-def sample_solution(
-    grid: Grid, max_trials: int = 20, seed: int | None = 0, growth: float = 6 / 5
-) -> Grid | None:
-    """Return a validated completed grid, or None ("no solution found within budget").
+def trial_budget(failure_probability: float = 1 / 3) -> int:
+    """Each independent trial succeeds with probability >= 1/8 if M > 0."""
+    if not 0 < failure_probability < 1:
+        raise ValueError("failure_probability must be between 0 and 1")
+    return math.ceil(math.log(failure_probability) / math.log(7 / 8))
 
-    Unknown number of solutions: random iteration count k < cap, cap grows by
-    `growth` each failed trial (BBHT). Output is always classically validated, so
-    there are no false positives.
+
+@dataclass(frozen=True)
+class SearchResult:
+    solution: Grid | None
+    trials: int
+    oracle_calls: int
+    oracle_call_budget: int
+    failure_bound_if_solvable: float
+
+
+def sample_solution_report(
+    grid: Grid,
+    max_trials: int | None = None,
+    seed: int | None = None,
+    failure_probability: float = 1 / 3,
+) -> SearchResult:
+    """Unknown-M search with a proven budget; see README for the bound.
+
+    Per trial: with probability 1/2 use zero iterations, otherwise choose j
+    uniformly from 0..ceil(2 sqrt(N))-1. Counts are logical quantum oracle
+    queries; classical sign-table preprocessing is separate simulation overhead.
+    Explicit smaller budgets have only the reported weaker guarantee.
     """
+    grid_spec(grid)  # malformed input is an error, not a search failure
+    required = trial_budget(failure_probability)
+    budget = required if max_trials is None else max_trials
+    if isinstance(budget, bool) or not isinstance(budget, Integral) or budget < 0:
+        raise ValueError("max_trials must be a nonnegative integer")
     if not clues_consistent(grid):
-        return None
-    k_cells = len(empties(grid))
+        return SearchResult(None, 0, 0, 0, 0.0)
+    if not empties(grid):
+        return SearchResult([list(row) for row in grid], 0, 0, 0, 0.0)
+    size = search_size(grid)
+    cap = math.isqrt(4 * size - 1) + 1  # ceil(2 sqrt(N)), using integer arithmetic
+    bound = (7 / 8) ** budget
+    call_budget = budget * (cap - 1)
+    if not budget:
+        return SearchResult(None, 0, 0, call_budget, bound)
+    signs = np.asarray(oracle_signs(grid), dtype=float)
     rng = random.Random(seed)
-    cap, limit = 1.0, math.sqrt(4**k_cells)
-    for _ in range(max_trials):
-        reps = rng.randrange(max(1, math.ceil(cap)))
-        amp = list(_grover_states(grid, reps))[-1]
-        z = rng.choices(range(4**k_cells), weights=amp**2)[0]
-        candidate = fill(grid, decode(z, k_cells))
+    calls = 0
+    for trial in range(1, budget + 1):
+        reps = 0 if rng.randrange(2) == 0 else rng.randrange(cap)
+        amp = np.full(size, 1 / math.sqrt(size))
+        for _ in range(reps):
+            amp *= signs
+            amp = 2 * amp.mean() - amp
+        calls += reps
+        z = rng.choices(range(size), weights=amp**2)[0]
+        candidate = fill(grid, decode(z, len(empties(grid)), grid_spec(grid)[2]))
         if is_valid_grid(candidate):
-            return candidate
-        cap = min(cap * growth, limit)
-    return None
+            return SearchResult(candidate, trial, calls, call_budget, bound)
+    return SearchResult(None, budget, calls, call_budget, bound)
+
+
+def sample_solution(
+    grid: Grid,
+    max_trials: int | None = None,
+    seed: int | None = None,
+    failure_probability: float = 1 / 3,
+) -> Grid | None:
+    """Return a validated solution or None; default success is >= 2/3 if solvable."""
+    return sample_solution_report(grid, max_trials, seed, failure_probability).solution
 
 
 def resources(grid: Grid) -> dict:
     """Qubit counts, oracle gate counts (already in {x,cx,ccx,z}) and depth."""
-    s, f, a = layout(grid)
     o = sudoku_oracle(grid)
+    s, f, a = layout(grid)
+    size = search_size(grid)
+    trials = trial_budget()
+    cap = math.isqrt(4 * size - 1) + 1
     return {
+        "grid_side": len(grid),
+        "bits_per_cell": grid_spec(grid)[2],
+        "search_size": size,
+        "default_trials": trials,
+        "oracle_call_budget": trials * (cap - 1),
         "search_qubits": len(s),
         "work_qubits": len(f) + len(a),
         "oracle_gates": dict(o.count_ops()),

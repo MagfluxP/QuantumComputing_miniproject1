@@ -1,7 +1,7 @@
 [project]
 name = "grover-sudoku"
 version = "0.1.0"
-description = "Grover search mini-project: 4x4 Sudoku in Qiskit"
+description = "Grover search mini-project: General Sudoku in Qiskit"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

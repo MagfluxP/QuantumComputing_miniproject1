@@ -1,4 +1,4 @@
-"""Grover search mini-project: 4x4 Sudoku."""
+"""Grover search mini-project: General Sudoku."""
 
 from . import sudoku, theory
 
